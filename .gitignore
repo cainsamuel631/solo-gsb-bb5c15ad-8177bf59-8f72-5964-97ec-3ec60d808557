@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# SQLite
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# Keep the data directory itself but ignore generated databases

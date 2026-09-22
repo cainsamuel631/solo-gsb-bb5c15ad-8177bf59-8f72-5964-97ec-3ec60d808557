@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    image: ts-anomaly-api:latest
+    container_name: ts-anomaly-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /app/data/detections.db
+    volumes:
+      - ts_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ts_data:
