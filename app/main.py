@@ -25,10 +25,13 @@ from .models import (
     IncidentAggregateResponse,
     LagCorrelationRequest,
     LagCorrelationResponse,
+    ResampleRequest,
+    ResampleResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
 )
+from .resample import resample
 from .trends import scan_trends
 
 
@@ -39,17 +42,19 @@ async def lifespan(app: FastAPI) -> None:
 
 
 app = FastAPI(
-    title="时间序列异常检测与趋势扫描 API",
+    title="时间序列异常检测、趋势扫描与重采样 API",
     description=(
         "接收带时间戳的数值序列：异常检测基于稳健滑动窗口（中位数 + MAD）识别突变，"
         "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
         "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间；"
         "时滞关联扫描对 driver / response 双序列按候选时滞平移并做一对一最近邻匹配，"
         "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag；"
+        "重采样在 anchor 对齐的整数微秒等间隔网格上输出 observed / interpolated / "
+        "missing 三类网格点，不跨采样断档外推；"
         "事件聚合读取已保存检测的异常段，按时间重叠或间隔不超过 gap_seconds "
         "跨检测聚合为事件（只读，不修改检测记录）。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -241,6 +246,31 @@ def create_lag_correlation_scan(req: LagCorrelationRequest) -> dict:
         match_tolerance_seconds=req.match_tolerance_seconds,
         min_pairs=req.min_pairs,
     )
+
+
+@app.post("/api/v1/resample", response_model=ResampleResponse, tags=["重采样"])
+def create_resample(req: ResampleRequest) -> dict:
+    """无状态等间隔重采样：输出与 anchor_time 对齐、位于首末样本闭区间内的
+    整数微秒网格点（observed / interpolated / missing），不跨断档外推。
+
+    时间戳重复、参数非有限、interval_seconds 不能表示为整数微秒或网格点数
+    超过 10000 时返回 422。
+    """
+    timestamps, values = _prepare_series(req.points)
+
+    try:
+        result = resample(
+            timestamps=timestamps,
+            values=values,
+            anchor_time=req.anchor_time,
+            interval_seconds=req.interval_seconds,
+            method=req.method,
+            max_gap_seconds=req.max_gap_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {"series_id": req.series_id, **result}
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

@@ -432,6 +432,87 @@ class DetectionListResponse(BaseModel):
     total: int
 
 
+class ResampleRequest(BaseModel):
+    """无状态等间隔重采样请求。"""
+
+    series_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="可选的业务序列标识，随响应回显",
+    )
+    points: list[PointIn] = Field(min_length=1, description="带时间戳的数值序列")
+    interval_seconds: FiniteFloat = Field(
+        gt=0,
+        description=(
+            "等间隔网格步长（秒，>0）：必须恰好能表示为整数微秒，否则 422"
+        ),
+    )
+    anchor_time: object = Field(
+        description=(
+            "网格锚点时间：ISO-8601 字符串或 epoch 秒/毫秒数字；"
+            "所有网格点均为 anchor_time + k·interval_seconds（k 为整数）"
+        )
+    )
+    method: Literal["linear", "previous"] = Field(
+        default="linear",
+        description=(
+            "非观测网格点的补值方法：linear=按前后样本时间比例线性插值；"
+            "previous=前值（阶梯）填充"
+        ),
+    )
+    max_gap_seconds: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "允许补值的最大相邻样本间隔（秒，≥0）：网格点前后样本间隔不超过"
+            "该值才补值，超过则 value=null、source=missing，不跨断档外推"
+        ),
+    )
+
+
+class ResampledPoint(BaseModel):
+    """重采样网格上的单个输出点。"""
+
+    timestamp: str = Field(description="网格时刻（与 anchor_time 对齐，UTC ISO-8601）")
+    value: float | None = Field(
+        description="输出值：observed/interpolated 时为数值；跨断档 missing 时为 null"
+    )
+    source: Literal["observed", "interpolated", "missing"] = Field(
+        description=(
+            "来源：observed=原始样本恰落网格；interpolated=按 method 补值；"
+            "missing=前后样本间隔超过 max_gap_seconds，无法补值"
+        )
+    )
+
+
+class MissingGap(BaseModel):
+    """重采样输出中的连续 missing 缺口范围。"""
+
+    start_index: int = Field(description="缺口起点在输出 points[] 中的下标（含）")
+    end_index: int = Field(description="缺口终点在输出 points[] 中的下标（含）")
+    start_time: str = Field(description="缺口首个缺失网格点时间")
+    end_time: str = Field(description="缺口末个缺失网格点时间")
+    point_count: int = Field(description="缺口包含的连续缺失网格点数")
+
+
+class ResampleResponse(BaseModel):
+    series_id: str | None = None
+    anchor_time: str = Field(description="回显：归一化为 UTC ISO-8601 的网格锚点")
+    interval_seconds: float = Field(description="回显：网格间隔（秒）")
+    method: Literal["linear", "previous"]
+    max_gap_seconds: float = Field(description="回显：允许补值的最大样本间隔（秒）")
+    sample_point_count: int = Field(description="输入原始样本点数")
+    grid_point_count: int = Field(description="首末样本闭区间内的网格点总数（≤10000）")
+    observed_count: int = Field(description="source=observed 的网格点数")
+    interpolated_count: int = Field(description="source=interpolated 的网格点数")
+    missing_count: int = Field(description="source=missing 的网格点数")
+    points: list[ResampledPoint] = Field(description="按时间升序排列的网格点")
+    missing_gaps: list[MissingGap] = Field(
+        description="连续 missing 缺口范围列表（按时间升序）；无缺口时为空"
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class IncidentAggregateRequest(BaseModel):
     """事件聚合请求：把多条已保存检测的异常段按时间邻近关系聚合。"""
 

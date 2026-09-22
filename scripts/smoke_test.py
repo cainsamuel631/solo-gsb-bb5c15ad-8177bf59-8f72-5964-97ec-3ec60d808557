@@ -21,6 +21,7 @@ from app.lag_correlation import (  # noqa: E402
     scan_lag_correlation,
 )
 from app.main import app  # noqa: E402
+from app.resample import resample  # noqa: E402
 from app.trends import _mann_kendall, scan_trends  # noqa: E402
 
 
@@ -705,6 +706,162 @@ def test_incident_aggregation_sorting_and_empty() -> None:
     print("✓ 事件聚合：成员稳定排序、series 覆盖、无异常检测与空事件列表正确")
 
 
+def test_resample_linear_grid_and_observed() -> None:
+    # 规则 60s 样本 0,10,20,30；锚点对齐整分，30s 网格
+    ts = [f"2026-09-22T10:{i:02d}:00Z" for i in range(4)]
+    vals = [0.0, 10.0, 20.0, 30.0]
+    r = resample(
+        ts, vals, anchor_time="2026-09-22T10:00:00Z",
+        interval_seconds=30, method="linear", max_gap_seconds=120,
+    )
+    assert r["grid_point_count"] == 7 and r["observed_count"] == 4
+    assert r["interpolated_count"] == 3 and r["missing_count"] == 0
+    assert r["missing_gaps"] == []
+    assert [p["source"] for p in r["points"]] == [
+        "observed", "interpolated", "observed", "interpolated",
+        "observed", "interpolated", "observed",
+    ]
+    # 线性插值恰为中点值
+    assert [p["value"] for p in r["points"] if p["source"] == "interpolated"] == [
+        5.0, 15.0, 25.0
+    ]
+    # 网格与锚点对齐、时间用整数微秒
+    assert r["anchor_time"] == "2026-09-22T10:00:00+00:00"
+    assert [p["timestamp"] for p in r["points"]] == [
+        "2026-09-22T10:00:00+00:00",
+        "2026-09-22T10:00:30+00:00",
+        "2026-09-22T10:01:00+00:00",
+        "2026-09-22T10:01:30+00:00",
+        "2026-09-22T10:02:00+00:00",
+        "2026-09-22T10:02:30+00:00",
+        "2026-09-22T10:03:00+00:00",
+    ]
+    print("✓ 重采样：linear 等间隔网格、observed/interpolated 分类与中点插值正确")
+
+
+def test_resample_anchor_alignment_and_closed_span() -> None:
+    # 锚点偏移 30s：样本整分都不落网格，网格被夹在首末闭区间内
+    ts = ["2026-09-22T10:00:00Z", "2026-09-22T10:01:00Z", "2026-09-22T10:02:00Z"]
+    vals = [0.0, 10.0, 20.0]
+    r = resample(
+        ts, vals, anchor_time="2026-09-22T10:00:30Z",
+        interval_seconds=60, method="linear", max_gap_seconds=120,
+    )
+    assert [p["timestamp"] for p in r["points"]] == [
+        "2026-09-22T10:00:30+00:00",
+        "2026-09-22T10:01:30+00:00",
+    ]
+    assert [p["value"] for p in r["points"]] == [5.0, 15.0]
+    assert all(p["source"] == "interpolated" for p in r["points"])
+
+    # 首末闭区间内没有与锚点对齐的网格点：空网格（合法，200）
+    r_empty = resample(
+        ["2026-09-22T10:00:00Z", "2026-09-22T10:00:15Z"], [0.0, 1.0],
+        anchor_time="2026-09-22T10:00:30Z",
+        interval_seconds=600, method="linear", max_gap_seconds=600,
+    )
+    assert r_empty["grid_point_count"] == 0
+    assert r_empty["points"] == [] and r_empty["missing_gaps"] == []
+    assert r_empty["observed_count"] == r_empty["interpolated_count"] == 0
+    assert r_empty["missing_count"] == 0
+    print("✓ 重采样：锚点对齐偏移、首末样本闭区间截断与空网格正确")
+
+
+def test_resample_gap_missing_no_extrapolation() -> None:
+    # 00:00~00:02 三个 60s 样本，断档 58 分钟，01:00/01:03 再两个样本；
+    # 2 分钟网格（锚点整分），max_gap=900s：断档内网格全部 missing，
+    # 尾点 01:02 被 01:00/01:03（间隔 180s）夹住做线性补值，不向任何一侧外推。
+    ts = [
+        "2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z", "2026-09-22T00:02:00Z",
+        "2026-09-22T01:00:00Z", "2026-09-22T01:03:00Z",
+    ]
+    vals = [0.0, 10.0, 20.0, 30.0, 40.0]
+    r = resample(
+        ts, vals, anchor_time="2026-09-22T00:00:00Z",
+        interval_seconds=120, method="linear", max_gap_seconds=900,
+    )
+    sources = [p["source"] for p in r["points"]]
+    assert sources[0] == "observed" and sources[-1] == "interpolated"
+    assert set(sources) == {"observed", "interpolated", "missing"}
+    assert r["observed_count"] == 3          # 00:00、00:02、01:00
+    assert r["interpolated_count"] == 1      # 01:02：30→40 按 120/180 比例
+    assert r["missing_count"] == 28
+    assert abs(r["points"][-1]["value"] - (30.0 + 10.0 * 120 / 180)) < 1e-12
+    # 缺口连续段：00:04 ~ 00:58 一段
+    assert len(r["missing_gaps"]) == 1
+    gap = r["missing_gaps"][0]
+    assert (gap["start_index"], gap["end_index"]) == (2, 29)
+    assert gap["point_count"] == 28
+    assert gap["start_time"] == "2026-09-22T00:04:00+00:00"
+    assert gap["end_time"] == "2026-09-22T00:58:00+00:00"
+    assert all(p["value"] is None for p in r["points"] if p["source"] == "missing")
+    # 网格首点 = 首个样本、末点不晚于末样本（无外推）
+    assert r["points"][0]["timestamp"] == "2026-09-22T00:00:00+00:00"
+    assert r["points"][-1]["timestamp"] == "2026-09-22T01:02:00+00:00"
+
+    # 间隔恰好等于 max_gap_seconds：允许补值（边界闭区间）
+    r_boundary = resample(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:02:00Z"], [0.0, 10.0],
+        anchor_time="2026-09-22T00:00:00Z",
+        interval_seconds=60, method="linear", max_gap_seconds=120,
+    )
+    assert [p["source"] for p in r_boundary["points"]] == [
+        "observed", "interpolated", "observed"
+    ]
+    assert r_boundary["points"][1]["value"] == 5.0
+    print("✓ 重采样：断档 missing、连续缺口范围、间隔边界与禁止外推正确")
+
+
+def test_resample_previous_and_microsecond_grid() -> None:
+    # previous：非观测网格取前值
+    ts = ["2026-09-22T00:00:00Z", "2026-09-22T00:01:00Z"]
+    vals = [7.0, 11.0]
+    r = resample(
+        ts, vals, anchor_time="2026-09-22T00:00:00Z",
+        interval_seconds=30, method="previous", max_gap_seconds=60,
+    )
+    assert [(p["source"], p["value"]) for p in r["points"]] == [
+        ("observed", 7.0), ("interpolated", 7.0), ("observed", 11.0),
+    ]
+
+    # 整数微秒网格：0.5ms 间隔、1 秒跨度 → 2001 点，中点 0.5ms 线性补 5.0
+    r_us = resample(
+        ["2026-09-22T00:00:00Z", "2026-09-22T00:00:01Z"], [0.0, 10.0],
+        anchor_time="2026-09-22T00:00:00Z",
+        interval_seconds=0.0005, method="linear", max_gap_seconds=10,
+    )
+    assert r_us["grid_point_count"] == 2001
+    assert r_us["points"][0]["source"] == "observed"
+    assert r_us["points"][1]["timestamp"] == "2026-09-22T00:00:00.000500+00:00"
+    assert abs(r_us["points"][1]["value"] - 0.005) < 1e-12
+
+    # 间隔不能表示为整数微秒 → ValueError（接口层映射为 422）
+    for bad_interval in (0.0000333, 0.0000004, 1.0 / 3.0):
+        try:
+            resample(
+                ["2026-09-22T00:00:00Z", "2026-09-22T00:00:01Z"], [0.0, 10.0],
+                anchor_time="2026-09-22T00:00:00Z",
+                interval_seconds=bad_interval, method="linear", max_gap_seconds=10,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"非整数微秒间隔应拒绝: {bad_interval}")
+
+    # 网格超 10000 点 → ValueError
+    try:
+        resample(
+            ["2026-09-22T00:00:00Z", "2026-09-22T01:00:00Z"], [0.0, 10.0],
+            anchor_time="2026-09-22T00:00:00Z",
+            interval_seconds=0.1, method="linear", max_gap_seconds=3600,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("网格超过 10000 点应拒绝")
+    print("✓ 重采样：previous 前值填充、整数微秒网格、非整微秒与超上限拒绝正确")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -1203,9 +1360,150 @@ def _exercise_api(client: "TestClient") -> None:
         (s["start_index"], s["end_index"]) for s in r.json()["segments"]
     ] == [(s["start_index"], s["end_index"]) for s in segs_b]
 
+    # 无状态重采样：两段采样（00:00~00:02 + 01:00/01:03，中间约 58 分钟断档），
+    # 2 分钟网格、max_gap=900s；段内补值，断档内全部 missing
+    resample_payload = {
+        "series_id": "test-series-resample",
+        "anchor_time": "2026-09-22T00:00:00Z",
+        "interval_seconds": 120,
+        "method": "linear",
+        "max_gap_seconds": 900,
+        "points": [
+            {"timestamp": "2026-09-22T00:00:00Z", "value": 0.0},
+            {"timestamp": "2026-09-22T00:01:00Z", "value": 10.0},
+            {"timestamp": "2026-09-22T00:02:00Z", "value": 20.0},
+            {"timestamp": "2026-09-22T01:00:00Z", "value": 30.0},
+            {"timestamp": "2026-09-22T01:03:00Z", "value": 40.0},
+        ],
+    }
+    r = client.post("/api/v1/resample", json=resample_payload)
+    assert r.status_code == 200, r.text
+    rb = r.json()
+    assert rb["series_id"] == "test-series-resample"
+    assert rb["anchor_time"] == "2026-09-22T00:00:00+00:00"
+    assert rb["interval_seconds"] == 120 and rb["method"] == "linear"
+    assert rb["max_gap_seconds"] == 900 and rb["sample_point_count"] == 5
+    assert rb["grid_point_count"] == 32
+    assert rb["observed_count"] == 3 and rb["interpolated_count"] == 1
+    assert rb["missing_count"] == 28
+    assert rb["grid_point_count"] == (
+        rb["observed_count"] + rb["interpolated_count"] + rb["missing_count"]
+    )
+    assert rb["points"][0] == {
+        "timestamp": "2026-09-22T00:00:00+00:00", "value": 0.0, "source": "observed"
+    }
+    assert rb["points"][-1] == {
+        "timestamp": "2026-09-22T01:02:00+00:00",
+        "value": 30.0 + 10.0 * 120 / 180,
+        "source": "interpolated",
+    }
+    assert len(rb["missing_gaps"]) == 1
+    assert rb["missing_gaps"][0]["point_count"] == 28
+    assert rb["missing_gaps"][0]["start_time"] == "2026-09-22T00:04:00+00:00"
+    assert rb["missing_gaps"][0]["end_time"] == "2026-09-22T00:58:00+00:00"
+
+    # previous 方法：非观测点取前值（01:02 在 01:00/01:03 间隔内 → 取 01:00 的值）
+    prev_payload = dict(resample_payload)
+    prev_payload["method"] = "previous"
+    prev_payload["max_gap_seconds"] = 600
+    r = client.post("/api/v1/resample", json=prev_payload)
+    assert r.status_code == 200, r.text
+    pv = {(p["timestamp"], p["source"]): p["value"] for p in r.json()["points"]}
+    assert pv[("2026-09-22T00:00:00+00:00", "observed")] == 0.0
+    assert pv[("2026-09-22T01:00:00+00:00", "observed")] == 30.0
+    assert pv[("2026-09-22T01:02:00+00:00", "interpolated")] == 30.0
+
+    # 无需预先排序：乱序提交结果一致
+    shuffled = dict(resample_payload)
+    shuffled["points"] = list(reversed(resample_payload["points"]))
+    r = client.post("/api/v1/resample", json=shuffled)
+    assert r.status_code == 200
+    assert r.json()["points"] == rb["points"]
+
+    # 整数微秒网格：0.0005 秒间隔、1 秒跨度共 2001 点
+    micro_payload = {
+        "anchor_time": "2026-09-22T00:00:00Z",
+        "interval_seconds": 0.0005,
+        "method": "linear",
+        "max_gap_seconds": 10,
+        "points": [
+            {"timestamp": "2026-09-22T00:00:00Z", "value": 0.0},
+            {"timestamp": "2026-09-22T00:00:01Z", "value": 10.0},
+        ],
+    }
+    r = client.post("/api/v1/resample", json=micro_payload)
+    assert r.status_code == 200, r.text
+    mb = r.json()
+    assert mb["grid_point_count"] == 2001
+    assert mb["points"][1]["timestamp"] == "2026-09-22T00:00:00.000500+00:00"
+    assert abs(mb["points"][1]["value"] - 0.005) < 1e-12
+
+    # 参数校验：重复时间戳
+    bad = dict(resample_payload)
+    bad["points"] = resample_payload["points"] + [resample_payload["points"][0]]
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+
+    # 参数校验：interval_seconds 非整数微秒 / 非正 / 非有限
+    bad = dict(micro_payload)
+    bad["interval_seconds"] = 0.0000333
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422 and "整数微秒" in r.text
+    bad = dict(micro_payload)
+    bad["interval_seconds"] = 0
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422
+    bad = dict(micro_payload)
+    bad["interval_seconds"] = float("inf")
+    r = client.post(
+        "/api/v1/resample",
+        content=_json.dumps(bad),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+    # 参数校验：max_gap_seconds 为负 / 非有限
+    bad = dict(resample_payload)
+    bad["max_gap_seconds"] = -1
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422
+    bad = dict(resample_payload)
+    bad["max_gap_seconds"] = float("nan")
+    r = client.post(
+        "/api/v1/resample",
+        content=_json.dumps(bad),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+    # 参数校验：value 非有限、method 非法、points 为空、网格超 10000 点
+    bad = dict(resample_payload)
+    bad["points"] = [
+        {"timestamp": "2026-09-22T00:00:00Z", "value": float("nan")},
+        {"timestamp": "2026-09-22T00:01:00Z", "value": 1.0},
+    ]
+    r = client.post(
+        "/api/v1/resample",
+        content=_json.dumps(bad),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    bad = dict(resample_payload)
+    bad["method"] = "cubic"
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422
+    bad = dict(resample_payload)
+    bad["points"] = []
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422
+    bad = dict(resample_payload)
+    bad["interval_seconds"] = 0.1
+    r = client.post("/api/v1/resample", json=bad)
+    assert r.status_code == 422 and "10000" in r.text
+
     print(
         "✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / "
-        "趋势扫描 / 时滞关联 / 事件聚合"
+        "趋势扫描 / 时滞关联 / 事件聚合 / 无状态重采样"
     )
 
 
@@ -1232,5 +1530,9 @@ if __name__ == "__main__":
     test_incident_aggregation_overlap_and_gap_boundary()
     test_incident_aggregation_same_detection_and_chaining()
     test_incident_aggregation_sorting_and_empty()
+    test_resample_linear_grid_and_observed()
+    test_resample_anchor_alignment_and_closed_span()
+    test_resample_gap_missing_no_extrapolation()
+    test_resample_previous_and_microsecond_grid()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")

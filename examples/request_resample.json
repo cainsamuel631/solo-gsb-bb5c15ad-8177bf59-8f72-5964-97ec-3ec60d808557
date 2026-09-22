@@ -1,0 +1,15 @@
+{
+  "series_id": "sensor-room-a-resample-demo",
+  "anchor_time": "2026-09-22T00:00:00Z",
+  "interval_seconds": 120,
+  "method": "linear",
+  "max_gap_seconds": 900,
+  "points": [
+    {"timestamp": "2026-09-22T00:00:00Z", "value": 20.0},
+    {"timestamp": "2026-09-22T00:01:00Z", "value": 20.2},
+    {"timestamp": "2026-09-22T00:02:00Z", "value": 20.4},
+    {"timestamp": "2026-09-22T00:03:00Z", "value": 20.6},
+    {"timestamp": "2026-09-22T01:00:00Z", "value": 24.0},
+    {"timestamp": "2026-09-22T01:03:00Z", "value": 24.6}
+  ]
+}
