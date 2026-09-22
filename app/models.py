@@ -504,3 +504,108 @@ class IncidentAggregateResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     database: str
+
+
+class ResampleRequest(BaseModel):
+    """无状态等间隔重采样请求。"""
+
+    points: list[PointIn] = Field(
+        min_length=1,
+        description="原始采样点（至少 1 个）；无需预先排序，服务端自动排序并拒绝重复时间戳",
+    )
+    anchor_time: object = Field(
+        description=(
+            "网格对齐锚点：网格时刻为 anchor_time + k·interval_seconds（k 为整数）。"
+            "时间戳格式与 points 一致（ISO-8601 或 epoch 秒/毫秒），可落在样本区间之外"
+        )
+    )
+    interval_seconds: FiniteFloat = Field(
+        gt=0,
+        description=(
+            "网格间隔（秒，>0 且有限），必须能表示为整数微秒，"
+            "如 0.3 可以、0.3000005（半微秒）返回 422"
+        ),
+    )
+    method: Literal["linear", "previous"] = Field(
+        default="linear",
+        description="补值方法：linear=前后样本线性插值；previous=取前一样本（前向填充）",
+    )
+    max_gap_seconds: FiniteFloat = Field(
+        ge=0,
+        description=(
+            "允许补值的最大前后样本间隔（秒，≥0 且有限）：网格点前后样本间隔"
+            "不超过该值时按 method 补值，否则返回 value=null、source=missing；"
+            "不向首末样本之外外推"
+        ),
+    )
+
+    @field_validator("anchor_time")
+    @classmethod
+    def _parseable_anchor(cls, v: object) -> object:
+        try:
+            parse_timestamp(v)
+        except ValueError as exc:
+            raise ValueError(f"anchor_time 无法解析: {exc}")
+        return v
+
+    @field_validator("interval_seconds")
+    @classmethod
+    def _whole_microsecond_interval(cls, v: float) -> float:
+        from .resampling import whole_microseconds
+
+        if whole_microseconds(v) is None:
+            raise ValueError(
+                f"interval_seconds={v} 不能表示为整数微秒（网格时间按整数微秒计算）"
+            )
+        return v
+
+
+class ResampledPoint(BaseModel):
+    """重采样网格上的单个点。"""
+
+    index: int = Field(description="网格点序号（从 0 开始）")
+    timestamp: str = Field(description="网格时刻（UTC ISO-8601）")
+    value: float | None = Field(
+        description="observed/interpolated 为数值；missing（断档）时为 null"
+    )
+    source: Literal["observed", "interpolated", "missing"] = Field(
+        description="来源：observed=原始样本恰落该网格点；interpolated=按 method 补值；missing=前后样本间隔超过 max_gap_seconds"
+    )
+
+
+class MissingGapRange(BaseModel):
+    """一段连续 missing 网格点及其包围样本（连续缺口范围）。"""
+
+    start_index: int = Field(description="缺口首个网格点序号")
+    end_index: int = Field(description="缺口末个网格点序号")
+    start_time: str = Field(description="缺口首个网格点时刻")
+    end_time: str = Field(description="缺口末个网格点时刻")
+    point_count: int = Field(description="缺口内网格点数（含首尾）")
+    before_time: str = Field(description="缺口前最后一个原始样本时刻")
+    after_time: str = Field(description="缺口后第一个原始样本时刻")
+    before_value: float = Field(description="缺口前最后一个原始样本值")
+    after_value: float = Field(description="缺口后第一个原始样本值")
+    sample_gap_seconds: float = Field(description="包围样本的实际时间差（秒）")
+    max_gap_seconds: float = Field(description="请求的允许补值间隔（秒，回显）")
+
+
+class ResampleResponse(BaseModel):
+    anchor_time: str = Field(description="实际使用的网格锚点（UTC ISO-8601，回显）")
+    interval_seconds: float
+    method: Literal["linear", "previous"]
+    max_gap_seconds: float
+    range_start_time: str = Field(description="首样本时刻（网格闭区间下界）")
+    range_end_time: str = Field(description="末样本时刻（网格闭区间上界）")
+    grid_start_time: str | None = Field(description="首个网格点时刻；网格为空时为 null")
+    grid_end_time: str | None = Field(description="末个网格点时刻；网格为空时为 null")
+    input_point_count: int = Field(description="原始样本数（去重前请求点数经排序后）")
+    point_count: int = Field(description="网格点总数（≤10000）")
+    observed_count: int = Field(description="source=observed 的点数")
+    interpolated_count: int = Field(description="source=interpolated 的点数")
+    missing_count: int = Field(description="source=missing 的点数")
+    points: list[ResampledPoint] = Field(description="按时间升序的网格点")
+    missing_ranges: list[MissingGapRange] = Field(
+        description="连续缺口范围列表（按时间升序）；无缺口时为空列表"
+    )
+
+    model_config = ConfigDict(extra="ignore")

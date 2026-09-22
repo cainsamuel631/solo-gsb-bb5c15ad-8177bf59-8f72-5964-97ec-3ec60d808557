@@ -25,10 +25,13 @@ from .models import (
     IncidentAggregateResponse,
     LagCorrelationRequest,
     LagCorrelationResponse,
+    ResampleRequest,
+    ResampleResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
 )
+from .resampling import epoch_microseconds, resample_series, whole_microseconds
 from .trends import scan_trends
 
 
@@ -48,8 +51,11 @@ app = FastAPI(
         "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag；"
         "事件聚合读取已保存检测的异常段，按时间重叠或间隔不超过 gap_seconds "
         "跨检测聚合为事件（只读，不修改检测记录）。"
+        "重采样接口在首末样本闭区间内输出与 anchor_time 对齐的等间隔网格（整数微秒计算），"
+        "原始样本落点标 observed，其余点按 linear/previous 补值，"
+        "前后样本间隔超过 max_gap_seconds 时标 missing（null），不跨断档外推。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -241,6 +247,42 @@ def create_lag_correlation_scan(req: LagCorrelationRequest) -> dict:
         match_tolerance_seconds=req.match_tolerance_seconds,
         min_pairs=req.min_pairs,
     )
+
+
+@app.post("/api/v1/resample", response_model=ResampleResponse, tags=["重采样"])
+def resample(req: ResampleRequest) -> dict:
+    """无状态等间隔重采样：输出首末样本闭区间内与 anchor_time 对齐的等间隔网格。
+
+    - 网格时间一律按**整数微秒**计算（anchor + k·interval），最多 10000 点；
+    - 原始样本恰落网格点标 ``observed``；
+    - 其余点仅在前后样本间隔 ``≤ max_gap_seconds`` 时按 ``linear`` / ``previous``
+      补值（``interpolated``），超过则 ``value=null``、``source=missing``；
+    - 网格严格限制在首末样本闭区间内，**不外推**。
+    """
+    try:
+        timestamps, values = _prepare_series(req.points, label="points ")
+    except ValueError as exc:
+        # 时间戳无法解析等输入错误统一返回 422（重复时间戳由 _prepare_series 直接抛 422）
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    anchor_us = epoch_microseconds(parse_timestamp(req.anchor_time))
+    # 已在模型校验中确认 interval 为整微秒；此处再防御性兜底
+    interval_us = whole_microseconds(req.interval_seconds)
+    if interval_us is None:
+        raise HTTPException(status_code=422, detail="interval_seconds 不能表示为整数微秒")
+
+    try:
+        return resample_series(
+            timestamps,
+            values,
+            interval_us=interval_us,
+            anchor_us=anchor_us,
+            max_gap_seconds=req.max_gap_seconds,
+            method=req.method,
+        )
+    except ValueError as exc:
+        # 网格点数超过上限等业务约束 → 422
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])

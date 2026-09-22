@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描与跨检测事件聚合服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描、双序列时滞关联扫描、跨检测事件聚合与无状态等间隔重采样服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。事件聚合接口读取 1~50 条**已保存检测**的异常段，按**时间重叠或间隔不超过 `gap_seconds`** 跨检测（也包括同一检测的相邻段）聚合为事件，返回事件起止、覆盖序列、段数、最大绝对 z 分数与稳定排序的成员定位（只读，不修改检测记录）。重采样接口在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格（网格时间按**整数微秒**计算，最多 10000 点）：原始样本恰落网格标 `observed`，其余点仅在前后样本间隔不超过 `max_gap_seconds` 时按 `linear` / `previous` 补值（`interpolated`），否则 `value=null`、`source=missing`，不跨断档补值、不外推（无状态，不入库）。
 
 ## 特性
 
@@ -16,6 +16,7 @@
 - **趋势扫描**：以 `window_size` / `step_size` 滑窗，每窗执行含**重复值方差修正**与**连续性校正**的 Mann-Kendall 检验，并按**实际时间差**计算 Theil-Sen 斜率（值/秒，非等距采样同样适用）；仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升 / 下降趋势；方向相同、时间范围重叠或首尾相接的显著窗口自动合并为趋势区间，返回区间范围、成员窗口、最小 p 值与成员斜率中位数。
 - **时滞关联扫描**：对 driver / response 双序列，按候选 `lag_seconds` 逐个把 driver 时间平移 `+lag`，再按时间顺序做**贪心一对一最近邻匹配**（容差 `match_tolerance_seconds` 内取最近点，等距取较早 response，已匹配点不复用）；仅对**配对数 ≥ min_pairs 且两侧方差非零**的候选计算 Pearson 相关系数，逐候选返回配对数、相关系数、可用状态与不可用原因；`best_lag` 按 |correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小依次确定，无可用候选时为 `null`。
 - **跨检测事件聚合**：`POST /api/v1/incidents/aggregate` 接收 1~50 个已保存的 `detection_id` 与非负 `gap_seconds`，把各检测的异常段统一按时间排序后顺序扫描——下一段开始时间不晚于当前事件结束时间 `+ gap_seconds`（即**时间重叠、首尾相接或间隔不超过 gap**）即并入同一事件，因此**同一检测的相邻异常段**同样会被合并，邻近关系可链式传递。每个事件返回起止时间、覆盖的 `series_id` / `detection_id`、成员段数、成员中的最大绝对 z 分数，以及按 `(start_time, detection_id, segment_index)` 稳定排序、可回溯到来源段的成员定位。接口只读，不写入或修改任何检测记录。
+- **无状态等间隔重采样**：`POST /api/v1/resample` 在**首末样本闭区间**内输出与 `anchor_time` 对齐的等间隔网格，网格时刻 `anchor + k·interval` 全部按**整数微秒**整数运算生成（无浮点累加漂移，最多 10000 点）。原始样本恰落某网格点时标 `observed` 直取样本值；其余点仅当其前后两个样本的间隔 **≤ `max_gap_seconds`** 时补值——`linear` 按实际时间差线性插值、`previous` 取前一样本（前向填充），统一标 `interpolated`；前后样本间隔超限则 `value=null`、`source=missing`，**不跨断档补值，也不向首末样本之外外推**。响应返回三类点计数（`observed_count` / `interpolated_count` / `missing_count`）与逐点结果，并把连续出现的 missing 点汇总为**连续缺口范围** `missing_ranges`（起止网格点、点数、包围样本及其实测间隔）。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
 - **接口文档**：启动后访问 Swagger UI `/docs`、ReDoc `/redoc`。
@@ -31,6 +32,7 @@
 │   ├── trends.py           # 滑窗 Mann-Kendall + Theil-Sen 趋势扫描
 │   ├── lag_correlation.py  # 双序列时滞关联扫描（平移 + 一对一匹配 + Pearson）
 │   ├── incidents.py        # 已保存检测异常段的跨检测事件聚合（只读）
+│   ├── resampling.py       # 无状态等间隔重采样（anchor 网格 + 缺口感知补值）
 │   ├── models.py           # Pydantic 请求/响应模型、时间戳解析
 │   └── database.py         # SQLite 存储层
 ├── examples/
@@ -38,7 +40,8 @@
 │   ├── request_guarded.json        # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
 │   ├── request_gap.json            # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
 │   ├── request_trends.json         # 趋势扫描示例请求（先升后降，方向切换）
-│   └── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
+│   ├── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
+│   └── request_resample.json       # 重采样示例请求（6 小时断档，missing + 连续缺口）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -70,6 +73,9 @@ curl -X POST http://localhost:8000/api/v1/trends \
 curl -X POST http://localhost:8000/api/v1/lag-correlation \
   -H "Content-Type: application/json" \
   -d @examples/request_lag_correlation.json
+curl -X POST http://localhost:8000/api/v1/resample \
+  -H "Content-Type: application/json" \
+  -d @examples/request_resample.json
 ```
 
 ### 方式二：本地 Python 运行
@@ -214,6 +220,41 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
   ]
 }
 ```
+
+### `POST /api/v1/resample` — 无状态等间隔重采样
+
+把任意（可能非等距的）采样序列重采样到与 `anchor_time` 对齐的等间隔网格上。**无状态接口，结果不入库。**
+
+网格与补值规则：
+
+1. 所有时间先换算为 **epoch 整数微秒**，网格时刻为 `t_k = anchor + k · interval_seconds`（`k` 为整数）；只保留落在**首末样本闭区间 `[t_first, t_last]`** 内的网格点，因此**绝不向首末样本之外外推**；
+2. 网格点与某原始样本同时刻时 `source=observed`，直接取该样本值；
+3. 其余点取严格位于其左 / 右两侧的最近样本：
+   - 两样本间隔 **≤ `max_gap_seconds`**（含等号）时补值并标 `source=interpolated`——`method=linear` 按实际时间差线性插值，`method=previous` 取前一样本（前向填充）；
+   - 两样本间隔 **> `max_gap_seconds`** 时认为跨在断档上，`value=null`、`source=missing`；
+4. 连续出现的 missing 点汇总为 `missing_ranges[]`（连续缺口范围），observed/interpolated 点会把缺口隔开。
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `points` | `[{timestamp, value}]` | 必填（≥1） | 原始采样点；时间戳格式与检测接口一致，无需预先排序，服务端自动排序并拒绝重复时间戳（422）；`value` 必须为有限数值 |
+| `anchor_time` | timestamp | 必填 | 网格对齐锚点（ISO-8601 字符串或 epoch 秒/毫秒数字，可落在样本区间之外；无法解析返回 422） |
+| `interval_seconds` | float | 必填 | 网格间隔（秒，**>0、有限、且必须能表示为整数微秒**，如 `0.3` 可以、`0.3000005` 即半微秒返回 422） |
+| `method` | string | `linear` | 补值方法：`linear`（前后样本线性插值）/ `previous`（取前一样本，前向填充） |
+| `max_gap_seconds` | float | 必填 | 允许补值的最大前后样本间隔（秒，**≥0 且有限**）：间隔不超过该值才补值，否则 missing；取 `0` 时只有 observed 点有值 |
+
+约束：`points` 至少 1 个且时间戳不重复；`interval_seconds` 为正、有限且为整微秒；`max_gap_seconds ≥ 0` 且有限；`method ∈ {linear, previous}`；**网格点数超过 10000 返回 422**（可增大间隔或缩短样本范围）。违反任一约束返回 422。
+
+响应：
+
+- 参数回显：`anchor_time`、`interval_seconds`、`method`、`max_gap_seconds`；
+- 范围：`range_start_time` / `range_end_time`（首末样本时刻）、`grid_start_time` / `grid_end_time`（实际首末网格点时刻；网格为空时为 `null`）；
+- 计数：`input_point_count`（原始样本数）、`point_count`（网格点数）以及三类点数量 `observed_count` / `interpolated_count` / `missing_count`；
+- `points[]`：按时间升序的网格点，每个含 `index`（网格序号，从 0 开始）、`timestamp`（UTC ISO-8601，亚秒网格带微秒后缀）、`value`（missing 时为 `null`）与 `source`（`observed` / `interpolated` / `missing`）；
+- `missing_ranges[]`：连续缺口范围，每个含 `start_index` / `end_index` / `start_time` / `end_time` / `point_count`、包围该缺口的 `before_time` / `after_time` / `before_value` / `after_value`、包围样本实测间隔 `sample_gap_seconds` 与回显的 `max_gap_seconds`；无缺口时为空列表。
+
+注意边界语义：网格严格夹在首末样本之间，故 missing 不会出现在网格两端；样本间隔**恰好等于** `max_gap_seconds` 时仍允许补值（`≤` 比较）；网格与样本的时刻比较、间隔比较都在整数微秒上进行，`max_gap_seconds` 允许亚微秒级浮点（按最近整微秒取整后比较）。仅一个样本且其不落在网格上时返回空网格（各计数为 0）。
 
 ### `GET /health` — 健康检查
 
@@ -367,6 +408,60 @@ curl -s -X POST http://localhost:8000/api/v1/incidents/aggregate \
 ```
 
 `gap_seconds=0` 时只合并时间重叠或首尾相接的段；未知 ID 返回 404，空列表 / 超过 50 个 ID / 重复 ID / 负间隔返回 422。接口只读，聚合前后 `GET /api/v1/detections/{id}` 的结果不变。
+
+### 无状态等间隔重采样（resample）
+
+```bash
+# 整点样本 00:00~06:00（值 10~16）与 12:00~15:00（值 20~23），中间有 6 小时断档。
+# 1 小时网格、与 00:00 对齐、max_gap=300s：
+# 11 个 observed；07:00~11:00 共 5 个网格点前后样本间隔 21600s > 300s，
+# 全部 value=null/source=missing，并汇总为一个连续缺口范围；不向区间外补点。
+curl -s -X POST http://localhost:8000/api/v1/resample \
+  -H "Content-Type: application/json" \
+  -d @examples/request_resample.json | python -m json.tool
+```
+
+响应（节选）：
+
+```json
+{
+  "anchor_time": "2026-09-22T00:00:00+00:00",
+  "interval_seconds": 3600.0,
+  "method": "linear",
+  "max_gap_seconds": 300.0,
+  "range_start_time": "2026-09-22T00:00:00+00:00",
+  "range_end_time": "2026-09-22T15:00:00+00:00",
+  "grid_start_time": "2026-09-22T00:00:00+00:00",
+  "grid_end_time": "2026-09-22T15:00:00+00:00",
+  "input_point_count": 11,
+  "point_count": 16,
+  "observed_count": 11,
+  "interpolated_count": 0,
+  "missing_count": 5,
+  "points": [
+    {"index": 0, "timestamp": "2026-09-22T00:00:00+00:00", "value": 10.0, "source": "observed"},
+    "...",
+    {"index": 7, "timestamp": "2026-09-22T07:00:00+00:00", "value": null, "source": "missing"},
+    "...",
+    {"index": 12, "timestamp": "2026-09-22T12:00:00+00:00", "value": 20.0, "source": "observed"}
+  ],
+  "missing_ranges": [
+    {
+      "start_index": 7, "end_index": 11,
+      "start_time": "2026-09-22T07:00:00+00:00",
+      "end_time": "2026-09-22T11:00:00+00:00",
+      "point_count": 5,
+      "before_time": "2026-09-22T06:00:00+00:00",
+      "after_time": "2026-09-22T12:00:00+00:00",
+      "before_value": 16.0, "after_value": 20.0,
+      "sample_gap_seconds": 21600.0,
+      "max_gap_seconds": 300.0
+    }
+  ]
+}
+```
+
+把 `max_gap_seconds` 提高到 `21600`（断档等长，`≤` 含等号）后，07:00~11:00 会按线性插值补出 17、18、19、20…，`missing_count` 变为 0；改用 `"method": "previous"` 时这些点取前一样本值（06:00 的 16）。`interval_seconds` 支持亚秒但必须为整微秒（如 `0.3` 合法、`0.3000005` 返回 422），亚秒网格时间戳形如 `2026-09-22T00:00:00.300000+00:00`。
 
 ### 内联 JSON 示例
 
@@ -547,6 +642,18 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 整体复杂度约 `O(S log S)`（`S` 为参与聚合的异常段总数，`S ≤ 各检测段数之和`）；接口不写入数据库，聚合结果不持久化。
 
+### 等间隔重采样算法（`POST /api/v1/resample`）
+
+1. 解析全部时间戳并排序、拒绝重复时间戳；把每个样本时刻换算为 **epoch 整数微秒**（亚秒精度，无浮点累加）。
+2. 校验 `interval_seconds` 可表示为整数微秒 `Δ`（允许 1 个 ULP 的浮点表示误差，如 `0.3s → 300000us`；半微秒如 `0.3000005s` 返回 422）。
+3. 用整数整除求位于首末样本闭区间内的网格下标范围：`k_min = ⌈(t_first − anchor)/Δ⌉`、`k_max = ⌊(t_last − anchor)/Δ⌋`，网格时刻 `t_k = anchor + k·Δ`；`k_max < k_min` 时网格为空；点数 `k_max − k_min + 1 > 10000` 返回 422。
+4. 逐网格点分类：
+   - 时刻与某样本微秒时刻相等 → `observed`，取样本值（哈希表直查）；
+   - 否则以二分定位严格左右最近样本 `(t₀, v₀)`、`(t₁, v₁)`：`t₁ − t₀ ≤ max_gap_us`（整数微秒比较，含等号）时补值——线性 `v = v₀ + (v₁ − v₀)·(t − t₀)/(t₁ − t₀)`，或 previous 取 `v₀`——标 `interpolated`；间隔超限标 `missing`、`value=null`。
+5. 顺序扫描网格点，把**连续**的 missing 点（被 observed/interpolated 点隔开即断开）汇总为 `missing_ranges[]`，记录起止网格点、点数以及包围样本（时刻、值、实测间隔）。
+
+网格点始终位于首末样本闭区间内，因此不需要（也不会）向区间两端外推；missing 只可能出现在内部断档处。整体复杂度约 `O((n + m) log n)`（`n` 样本数、`m` 网格点数，`m ≤ 10000`）；接口无状态，结果不写入 SQLite。
+
 ## 运行测试
 
 ```bash
@@ -554,7 +661,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、事件聚合（时间重叠 / 首尾相接 / 间隔等于与略大于 `gap_seconds` 的边界、同一检测相邻段合并、链式传递合并、成员按 `(start_time, detection_id, segment_index)` 稳定排序与段序号回溯、`series_id` 覆盖、无异常检测贡献 0 段与全空结果）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳，事件聚合接口的空 ID 列表 / 超过 50 个 ID / 重复 ID / 负间隔 / 非有限间隔 / 未知 ID 返回 404 / 聚合后检测记录不变的只读保证）、无状态重采样（anchor 对齐整数微秒网格与首末闭区间 / 不外推、observed/interpolated/missing 三类分类与三类点计数、linear 按时间比例插值与 previous 前向填充、超 `max_gap_seconds` 断档返回 null 与连续缺口范围（包围样本与实测间隔）、多处独立缺口分别报告、亚秒整微秒网格与半微秒间隔拒绝、`max_gap` 等号边界与 `max_gap=0`、单样本空网格、网格 10000 点上限与越界 422，以及接口层的重复时间戳 / 间隔非整微秒或非有限或非正 / `max_gap` 负或非有限 / 空 points / 非法 method / anchor 无法解析或非有限 / value 非有限 / 网格超上限等 422 校验与乱序、epoch 秒毫秒 anchor 兼容）。
 
 ## 备注
 
